@@ -1,0 +1,271 @@
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+# =========================
+# 0) 공통 상수/함수
+# =========================
+R_air = 286.9     # J/(kg·K)  (공기 기준)
+gamma = 1.4
+Cp_air = gamma * R_air / (gamma - 1)
+
+# =========================
+# 1) 압축기 + 모터 모델
+# =========================
+Jcp = 5e-5
+kt = 0.0225
+kv = 0.0153
+Rmm = 1.2
+eta_mm = 0.985
+eta_cp = 0.8
+
+rho_air_ref = 1.23
+d_cp = 0.2286
+Tatm = 298.15
+Patm = 280000
+
+# ---- 여기서 PSA 고압과 일치
+PH = 750000    # Pa
+PL = 101325    # Pa
+tfp = 20       # s
+Pout = 750000      # 압축기 출구압을 PSA 고압과 동일화 (일관성)
+
+# 맵 계수
+a0 = 2.21195e-3; a1 = -4.63685e-5; a2 = -5.36235e-4; a3 = 2.70399e-4; a4 = -3.69906e-5
+b0 = 2.44419;    b1 = -1.34837;    b2 = 1.76567
+c0 = 0.43331;    c1 = -0.68344;    c2 = 0.80121;    c3 = -0.42937; c4 = 0.10581; c5 = -9.78755e-3
+
+omega0 = 8400.0
+
+def voltage_profile(t):
+    # 필요시 바꿔 써도 됨(현재 206 V 고정)
+    return 206.0
+
+def psi_value(U_cp):
+    return (Cp_air * Tatm / (0.5*(U_cp**2))) * (((Pout / Patm)**((gamma - 1) / gamma)) - 1)
+
+def mach_number(U_cp):
+    return U_cp / np.sqrt(gamma * R_air * Tatm)
+
+def phi_max(M):   return a4*M**4 + a3*M**3 + a2*M**2 + a1*M + a0
+def beta_poly(M): return b2*M**2 + b1*M + b0
+def psi_max(M):   return c5*M**5 + c4*M**4 + c3*M**3 + c2*M**2 + c1*M + c0
+
+def T_out():
+    # 등엔트로피 압축에 효율 반영한 출구온도(간단 모델)
+    return Tatm + (Tatm / eta_cp) * (((Pout / Patm)**((gamma - 1) / gamma)) - 1)
+
+def air_density_out():
+    Tout = T_out()
+    return Pout / (R_air * Tout)
+
+def phi_value(U_cp):
+    M = mach_number(U_cp)
+    phi_m = phi_max(M)
+    beta_m = beta_poly(M)
+    psi_m = psi_max(M)
+    psi = psi_value(U_cp)
+    psi_e = min(psi, psi_m)
+    exponent = beta_m * (psi_e / psi_m - 1)
+    return phi_m * (1 - np.exp(exponent))
+
+def compressor_torque(omega, V):
+    U_cp = omega * d_cp / 2
+    phi = phi_value(U_cp)
+    airdensity = air_density_out()
+    Wcp = (np.pi * d_cp**2 * airdensity * U_cp * phi) / 4  # kg/s
+    term = ((Pout / Patm) ** ((gamma - 1) / gamma)) - 1
+    # 회전수 0 방지
+    omega_eff = max(omega, 1e-6)
+    tau_cp = Cp_air / omega_eff * Tatm / eta_cp * term * Wcp
+    return tau_cp, Wcp
+
+def motor_torque(omega, V):
+    return eta_mm * kt / Rmm * (V - kv * omega)
+
+def d_omega_dt(t, omega):
+    V = voltage_profile(t)
+    tau_mm = motor_torque(omega[0], V)
+    tau_cp, _ = compressor_torque(omega[0], V)
+    return [(tau_mm - tau_cp) / Jcp]
+
+# =========================
+# 2) PSA 모델
+# =========================
+Rg = 8.314
+T = 300.15
+eps = 0.32
+DL = 9e-7
+KA = 9.35;   kA = 0.0832
+KB = 9.35;   kB = 0.00468
+
+a_len = column_length = 2.0
+N = 11
+delta_z = column_length / (N - 1)
+
+# 스펙트럴 미분행렬(사용자 제공)
+Matrix_A = np.array([
+    [-9.1602, 14.96, -10.336, 8.3222, -7.0296, 6.0402, -5.1923, 4.3967, -3.5791, 2.632, -1.0543],
+    [-2.9225, -4.0248, 10.913, -6.9352, 5.3886, -4.4499, 3.7429, -3.1292, 2.528, -1.8512, 0.74031],
+    [0.88657, -4.7918, -2.6072, 9.9843, -5.9667, 4.4664, -3.5791, 2.9127, -2.3168, 1.6823, -0.67052],
+    [-0.43165, 1.8414, -6.0373, -1.9568, 9.9317, -5.6682, 4.0959, -3.1667, 2.4498, -1.753, 0.69475],
+    [0.26641, -1.0454, 2.6363, -7.257, -1.5918, 10.418, -5.7238, 3.9871, -2.933, 2.0468, -0.80363],
+    [-0.19229, 0.72519, -1.6577, 3.479, -8.7513, -1.365, 11.448, -6.0685, 4.0333, -2.6903, 1.0394],
+    [0.15681, -0.57866, 1.2602, -2.3849, 4.5612, -10.86, -1.2163, 13.232, -6.7274, 4.0901, -1.5331],
+    [-0.14276, 0.52014, -1.1026, 1.9825, -3.4161, 6.1897, -14.227, -1.1174, 16.312, -7.6987, 2.7006],
+    [0.14633, -0.52909, 1.1043, -1.9311, 3.1641, -5.1796, 9.1072, -20.538, -1.0531, 22.03, -6.3204],
+    [-0.17802, 0.64096, -1.3265, 2.2859, -3.6528, 5.7158, -9.16, 16.036, -36.445, -1.0154, 27.099],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+])
+Matrix_B = np.array([
+    [-23.43, -5.8982, 61.295, -61.652, 56.372, -50.304, 44.148, -37.841, 31.029, -22.91, 9.1916],
+    [70.069, -144.95, 83.106, -6.6484, -5.6013, 8.5995, -9.0083, 8.3874, -7.1837, 5.4251, -2.1954],
+    [-12.372, 98.598, -177.83, 108.28, -21.426, 5.9422, -1.0519, -0.7598, 1.33, -1.2495, 0.54203],
+    [4.3848, -22.477, 120.02, -211.98, 132.66, -30.953, 12.171, -5.7949, 3.0242, -1.6252, 0.56268],
+    [-2.1733, 9.5551, -30.959, 148.17, -262.28, 167.64, -42.018, 18.31, -9.8658, 5.6814, -2.0566],
+    [1.3362, -5.4638, 14.731, -41.745, 192.42, -345.15, 225.38, -59.019, 26.879, -14.526, 5.1562],
+    [-0.96735, 3.8021, -9.3693, 21.81, -58.871, 269.78, -495.39, 331.94, -89.812, 40.772, -13.694],
+    [0.80723, -3.1, 7.2688, -15.363, 33.914, -90.774, 423.24, -808.55, 561.48, -154.48, 45.56],
+    [-0.96735, 2.9497, -6.7215, 13.485, -27.033, 59.36, -162.81, 796.07, -1639.6, 1202.6, -237.59],
+    [0.91276, -3.431, 7.6977, -15.026, 28.721, -57.778, 132.03, -390.11, 2140.3, -5370.9, 3527.5],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+])
+
+# 초기조건
+yA0 = np.full(N, 0.21)
+qA0 = np.zeros(N); qB0 = np.zeros(N)
+y_init = np.concatenate([yA0, qA0, qB0])
+
+def P_time(t, PH, PL, tfp):
+    return PH + (PL - PH) * ((t / tfp) - 1)**2 if t < tfp else PH
+
+def differ_pressure(t):
+    return 2 * (PL - PH) * ((t / tfp) - 1) / tfp if t < tfp else 0.0
+
+def apply_boundary_conditions(yA):
+    yA[-1] = yA[-2]
+    return yA
+
+# =========================
+# 3) 압축기 해석 → Wcp(t) 보간
+# =========================
+t_end_psa = 40.0
+t_eval_cp = np.linspace(0.0, t_end_psa, 2000)
+sol_cp = solve_ivp(d_omega_dt, (0.0, t_end_psa), [omega0],
+                   method="LSODA", t_eval=t_eval_cp, rtol=1e-6, atol=1e-9)
+
+Wcp_arr = np.zeros_like(sol_cp.t)
+for i, (t, om) in enumerate(zip(sol_cp.t, sol_cp.y[0])):
+    _, Wcp_i = compressor_torque(om, voltage_profile(t))
+    Wcp_arr[i] = Wcp_i  # kg/s
+
+def Wcp_of_t(t):
+    # 선형보간
+    return np.interp(t, sol_cp.t, Wcp_arr)
+
+# -------------------------
+# A_cs와 y_N2 (문헌/설계 값)
+# -------------------------
+A_cs = 0.5756       # m^2 (문헌에서 계산된 단면적)
+y_N2_feed = 0.79    # 공기 기준; 순질소면 1.0로
+
+def T_in():
+    # 압축기 출구온도 사용(상수로 취급)
+    return T_out()
+
+def v_inlet_from_Wcp(t):
+    W = Wcp_of_t(t)                # kg/s
+    Pin = P_time(t, PH, PL, tfp)   # Pa
+    Tin = T_in()                   # K
+    rho_in = Pin / (R_air * Tin)   # kg/m^3
+    # 인터스티셜 속도 v = (W/ρ) / (A  * y_N2)
+    v = (W / rho_in) / (A_cs * y_N2_feed)
+    return max(v, 0.0)  # 안전장치
+
+# =========================
+# 4) PSA ODE (압축기 유량 주입)
+# =========================
+def psa_odes(t, y, PH, PL, tfp):
+    yA = y[0:N].copy()
+    qA = y[N:2*N]
+    qB = y[2*N:3*N]
+    yB = 1.0 - yA
+
+    dydt = np.zeros_like(y)
+    P = P_time(t, PH, PL, tfp)
+    dP_dt = differ_pressure(t)
+
+    dqA_dt = kA * (KA * yA * P / (Rg * T) - qA)
+    dqB_dt = kB * (KB * yB * P / (Rg * T) - qB)
+
+    # --- 입구 속도: 압축기 질량유량으로부터 변환 ---
+    vg_new = np.zeros(N)
+    vg_new[0] = v_inlet_from_Wcp(t)
+
+    # 연속방정식으로 베드 내부 속도장 적분
+    for j in range(N-1):
+        dvg_dz = - ((1-eps)/eps) * (Rg*T/P) * (dqA_dt[j] + dqB_dt[j]) - (1/P) * dP_dt
+        vg_new[j+1] = vg_new[j] + dvg_dz * delta_z
+
+    # 공간미분
+    dyA_dz   = Matrix_A @ yA
+    d2yA_dz2 = Matrix_B @ yA
+
+    # 경계조건
+    yA = apply_boundary_conditions(yA)
+    yA[0] = 0.21
+    dydt[0] = 0.0
+
+    # 조성 수송방정식
+    for i in range(N):
+        convection_A = -vg_new[i] / a_len * dyA_dz[i]
+        diffusion_A  =  DL / (a_len**2) * d2yA_dz2[i]
+        adsorption_A = ((1-eps)/eps) * (Rg*T/P) * ((yA[i]-1)*dqA_dt[i] + yA[i]*dqB_dt[i])
+        pressure_A   = (yA[i]/P) * dP_dt
+        dydt[i] = diffusion_A + convection_A + adsorption_A + pressure_A
+
+    # 흡착량 시간미분
+    dydt[N:2*N]     = dqA_dt
+    dydt[2*N:3*N]   = dqB_dt
+    return dydt
+
+# =========================
+# 5) 통합 시뮬레이션 실행
+# =========================
+t_span = (0.0, t_end_psa)
+t_eval = np.linspace(*t_span, 401)
+sol = solve_ivp(lambda t, y: psa_odes(t, y, PH, PL, tfp),
+                t_span, y_init, method='LSODA',
+                t_eval=t_eval, rtol=1e-6, atol=1e-8)
+
+print("PSA success:", sol.success, sol.message)
+
+# =========================
+# 6) 결과 시각화 예시
+# =========================
+yA_sol = sol.y[0:N, :]
+yB_sol = 1.0 - yA_sol
+first, fifth, tenth = yB_sol[0], yB_sol[4], yB_sol[9]
+P_sol = np.array([P_time(t, PH, PL, tfp) for t in sol.t]) / 1000.0
+
+fig, ax1 = plt.subplots()
+ax1.plot(sol.t, first,  label='Bed idx 0 (N2)',  marker='s', markevery=20)
+ax1.plot(sol.t, fifth,  label='Bed idx 4 (N2)',  marker='^', markevery=20)
+ax1.plot(sol.t, tenth,  label='Bed idx 9 (N2)',  marker='*', markevery=20)
+ax1.set_ylabel('N$_2$ purity')
+ax1.set_xlabel('t (s)')
+ax1.set_ylim(0.78, 1.00)
+ax2 = ax1.twinx()
+ax2.plot(sol.t, P_sol, label='Pressure', color='red', marker='o', markevery=20)
+ax2.set_ylabel('Pressure (kPa)')
+ax2.set_ylim(100, 770)
+ax1.legend(loc='lower right')
+plt.tight_layout()
+plt.show()
+
+print("Last-step N2 profile:", yB_sol[:, -1])
+plt.plot(np.arange(N), yB_sol[:, -1], marker='o')
+plt.xlabel('Bed Index')
+plt.ylabel('N2 Purity (t = %.1fs)' % t_end_psa)
+plt.title('N2 Purity along bed')
+plt.show()
